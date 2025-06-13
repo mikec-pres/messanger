@@ -50,14 +50,30 @@ func main() {
 	chat(conn)
 }
 
-// chat: read a line from the console, send it, wait for the peer's line, print it, repeat.
 func chat(conn net.Conn) {
 	console := bufio.NewReader(os.Stdin)
 	peer := bufio.NewReader(conn)
 
+	var line, reply string
+	var err error
+
+	go func() {
+		for {
+			reply, err = peer.ReadString('\n')
+			if err == io.EOF {
+				fmt.Println("peer disconnected")
+				return
+			}
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println("peer:", strings.TrimRight(reply, "\r\n"))
+		}
+	}()
+
 	for {
 		fmt.Print("> ")
-		line, err := console.ReadString('\n')
+		line, err = console.ReadString('\n')
 		if err == io.EOF {
 			return
 		}
@@ -70,15 +86,5 @@ func chat(conn net.Conn) {
 		if err != nil {
 			log.Fatal(err)
 		}
-
-		reply, err := peer.ReadString('\n')
-		if err == io.EOF {
-			fmt.Println("peer disconnected")
-			return
-		}
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Println("peer:", strings.TrimRight(reply, "\r\n"))
 	}
 }
