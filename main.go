@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 )
 
@@ -44,47 +46,101 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-	defer conn.Close()
 
 	fmt.Println("connected to", conn.RemoteAddr())
-	chat(conn)
+	err = chat(conn)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
-func chat(conn net.Conn) {
-	console := bufio.NewReader(os.Stdin)
-	peer := bufio.NewReader(conn)
+func chat(conn net.Conn) error {
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	defer signal.Stop(interrupt)
 
-	var line, reply string
-	var err error
+	done := make(chan struct{})
+	defer close(done)
 
+	lines := make(chan string)
+	consoleErr := make(chan error, 1)
+	go readConsole(lines, consoleErr, done)
+
+	peerErr := make(chan error, 1)
 	go func() {
-		for {
-			reply, err = peer.ReadString('\n')
-			if err == io.EOF {
-				fmt.Println("peer disconnected")
-				return
-			}
-			if err != nil {
-				log.Fatal(err)
-			}
-			fmt.Println("peer:", strings.TrimRight(reply, "\r\n"))
-		}
+		peerErr <- readPeer(conn)
 	}()
 
 	for {
+		select {
+		case line := <-lines:
+			_, err := fmt.Fprintf(conn, "%s\n", line)
+			if err != nil {
+				return closeAndWait(conn, peerErr, fmt.Errorf("send: %w", err))
+			}
+		case err := <-consoleErr:
+			if err == io.EOF {
+				return closeAndWait(conn, peerErr, nil)
+			}
+			return closeAndWait(conn, peerErr, fmt.Errorf("read console: %w", err))
+		case <-interrupt:
+			return closeAndWait(conn, peerErr, nil)
+		case err := <-peerErr:
+			closeErr := conn.Close()
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return fmt.Errorf("close connection: %w", closeErr)
+			}
+			return nil
+		}
+	}
+}
+
+func closeAndWait(conn net.Conn, peerErr <-chan error, reason error) error {
+	err := conn.Close()
+	if err != nil {
+		return fmt.Errorf("close connection: %w", err)
+	}
+	err = <-peerErr
+	if reason != nil {
+		return reason
+	}
+	return err
+}
+
+func readConsole(lines chan<- string, errs chan<- error, done <-chan struct{}) {
+	console := bufio.NewReader(os.Stdin)
+	for {
 		fmt.Print("> ")
-		line, err = console.ReadString('\n')
-		if err == io.EOF {
+		line, err := console.ReadString('\n')
+		if err != nil {
+			errs <- err
 			return
 		}
-		if err != nil {
-			log.Fatal(err)
+		select {
+		case lines <- strings.TrimRight(line, "\r\n"):
+		case <-done:
+			return
 		}
-		line = strings.TrimRight(line, "\r\n")
+	}
+}
 
-		_, err = fmt.Fprintf(conn, "%s\n", line)
-		if err != nil {
-			log.Fatal(err)
+func readPeer(conn net.Conn) error {
+	peer := bufio.NewReader(conn)
+	for {
+		reply, err := peer.ReadString('\n')
+		if err == io.EOF {
+			fmt.Println("peer disconnected")
+			return nil
 		}
+		if errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("receive: %w", err)
+		}
+		fmt.Println("peer:", strings.TrimRight(reply, "\r\n"))
 	}
 }
